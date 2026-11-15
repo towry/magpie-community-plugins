@@ -248,7 +248,10 @@ class FakeAgy {
       this.respond(id, {
         protocolVersion: 1,
         agentInfo: { name: "fake-agy", version: this.kit.agentVersion },
-        agentCapabilities: this.kit.sessionResume ? { sessionCapabilities: { resume: {} } } : {},
+        agentCapabilities: {
+          ...(this.kit.sessionResume ? { sessionCapabilities: { resume: {} } } : {}),
+          ...(this.kit.supportsImages ? { promptCapabilities: { image: true } } : {}),
+        },
       })
     } else if (method === "session/new" && this.kit.sessionNewError) {
       // Real agy 1.5.3 not signed in: {"code":-32000,"message":"Authentication required"}.
@@ -433,6 +436,7 @@ export async function createBridgeKit(options = {}) {
     sessionNewError: options.sessionNewError ?? null,
     sessionNewDelayMs: options.sessionNewDelayMs ?? 0,
     sessionResume: options.sessionResume ?? false,
+    supportsImages: options.supportsImages ?? false,
     agentVersion: options.agentVersion ?? "1.5.0",
     setModels: [],
     acpLog: [],

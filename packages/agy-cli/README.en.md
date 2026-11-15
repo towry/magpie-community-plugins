@@ -79,6 +79,11 @@ MCP server. The control port listens on loopback only, with a token per process.
   newer, because the ACP server has to advertise image support. An image a tool
   returns (a screenshot from `read`) goes to agy as a prompt image too: over MCP,
   agy would save it to a file the model can't open.
+  HTTPS Google Cloud Storage, Cloudflare R2 and AWS S3 image URLs from clients
+  such as Amp are downloaded into inline data, without client credentials. Downloads
+  allow one redirect to those storage hosts, take at most 15 seconds, and accept up
+  to 4.9 MB per image. Formats are detected from bytes; history images use a bounded
+  in-memory cache. Other hosts still require inline data.
 - **Tool calls**: parallel and consecutive calls both work. A tool that runs past
   150 seconds first gets a "still running" placeholder; once the real result
   arrives, the same turn continues, and the client executes each call exactly once.
@@ -302,8 +307,9 @@ off unless you turn it on.
 - **Usage shows "Limits not available" or a version error**: that window has no
   measurable data. For a version error, upgrade agy to 1.1.11 or later.
 - **Image requests return HTTP 400**: the running agy does not advertise image
-  support (1.5.0 or later is needed). Only inline base64 is accepted; image URLs
-  and binary documents such as PDFs are rejected.
+  support (1.5.0 or later is needed), or a cloud-storage image URL is no longer
+  anonymously downloadable. Expired URLs, other hosts, unsupported formats,
+  oversized images and binary documents such as PDFs are rejected.
 - **A reply contains "Agent execution terminated due to error."**: that is agy's
   in-band error marker. The plugin reads the real cause from agy's log and ends
   the turn with an error instead of passing the marker through as text. agy

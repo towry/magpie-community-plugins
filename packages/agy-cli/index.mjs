@@ -4726,6 +4726,106 @@ function renderContinuedTurnParts(messages) {
   return renderTurnMessagesParts(messages)
 }
 
+// ACP requires bytes, not a URI. Amp supplies provider-fetchable cloud-storage
+// URLs; never forward client credentials or turn this into an arbitrary URL proxy.
+const urlImages = new Map()
+let urlImageBytes = 0
+const MAX_IMAGE_BYTES = 4_900_000
+const MAX_IMAGE_CACHE_BYTES = 16 * 1024 * 1024
+
+function cloudImageURL(value) {
+  if (typeof value !== "string") throw new UnsupportedContent("an invalid image URL")
+  let url
+  try { url = new URL(value) } catch { throw new UnsupportedContent("an invalid image URL") }
+  const host = url.hostname
+  const trusted = host === "storage.googleapis.com" || host.endsWith(".storage.googleapis.com") ||
+    host.endsWith(".r2.cloudflarestorage.com") || host.endsWith(".r2.dev") ||
+    /^(?:[a-z0-9.-]+\.)?s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com$/.test(host)
+  if (url.protocol !== "https:" || url.username || url.password || url.port || !trusted) {
+    throw new UnsupportedContent("an image URL outside HTTPS cloud storage; provide inline image data instead")
+  }
+  return url
+}
+
+async function fetchURLImage(value, callerSignal) {
+  // Validate even cache hits. Keys include the entire signed query string.
+  let url = cloudImageURL(value)
+  const key = url.href
+  const cached = urlImages.get(key)
+  if (cached) {
+    urlImages.delete(key)
+    urlImages.set(key, cached)
+    return cached
+  }
+  const timeout = AbortSignal.timeout(15_000)
+  const signal = callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout
+  try {
+    for (let redirects = 0; ; redirects++) {
+      const response = await globalThis.fetch(url.href, { redirect: "manual", credentials: "omit", signal })
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location")
+        await response.body?.cancel()
+        if (redirects >= 1 || !location) throw new UnsupportedContent("an image URL with too many or invalid redirects")
+        url = cloudImageURL(new URL(location, url).href)
+        continue
+      }
+      if (response.status !== 200 || !response.body || Number(response.headers.get("content-length")) > MAX_IMAGE_BYTES) {
+        await response.body?.cancel()
+        throw new UnsupportedContent(`an image URL download (HTTP ${response.status}; expected an image up to ${MAX_IMAGE_BYTES} bytes)`)
+      }
+      const reader = response.body.getReader()
+      const chunks = []
+      let length = 0
+      try {
+        for (;;) {
+          const { done, value: chunk } = await reader.read()
+          if (done) break
+          length += chunk.byteLength
+          if (length > MAX_IMAGE_BYTES) throw new UnsupportedContent(`a URL image larger than ${MAX_IMAGE_BYTES} bytes`)
+          chunks.push(Buffer.from(chunk))
+        }
+      } finally {
+        await reader.cancel()
+      }
+      const bytes = Buffer.concat(chunks, length)
+      const media_type = bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ? "image/png" :
+        bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 ? "image/jpeg" :
+        ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii")) ? "image/gif" :
+        bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP" ? "image/webp" : null
+      if (!media_type) throw new UnsupportedContent("a URL image other than PNG, JPEG, GIF or WebP")
+      const source = { type: "base64", media_type, data: bytes.toString("base64") }
+      urlImageBytes -= urlImages.get(key)?.data.length || 0
+      urlImages.set(key, source)
+      urlImageBytes += source.data.length
+      while (urlImages.size > 32 || urlImageBytes > MAX_IMAGE_CACHE_BYTES) {
+        const oldest = urlImages.keys().next().value
+        urlImageBytes -= urlImages.get(oldest).data.length
+        urlImages.delete(oldest)
+      }
+      return source
+    }
+  } catch (error) {
+    // Fetch errors may contain signed URLs. Only our own fixed errors are safe.
+    if (error instanceof UnsupportedContent) throw error
+    throw new UnsupportedContent("a URL image that could not be downloaded (network, cancellation or timeout)")
+  }
+}
+
+async function inlineURLImages(body, signal) {
+  if (!Array.isArray(body?.messages)) return
+  for (const message of body.messages) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      const parts = block?.type === "tool_result" && Array.isArray(block.content) ? block.content : [block]
+      for (const part of parts) {
+        if (part?.type === "image" && part.source?.type === "url") {
+          part.source = await fetchURLImage(part.source.url, signal)
+        }
+      }
+    }
+  }
+}
+
 function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")
@@ -6028,6 +6128,7 @@ export const AntigravityBridgePlugin = async () => {
             try {
               const raw = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body)
               body = JSON.parse(raw)
+              await inlineURLImages(body, init.signal || fetchInput?.signal)
               validateBody(body)
             } catch (error) {
               return jsonError(error.statusCode ?? 400, error.message)
