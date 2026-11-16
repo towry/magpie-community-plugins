@@ -257,7 +257,10 @@ class FakeAgy {
         this.respond(id, {
           protocolVersion: 1,
           agentInfo: { name: "fake-agy", version: this.kit.agentVersion },
-          agentCapabilities: this.kit.sessionResume ? { sessionCapabilities: { resume: {} } } : {},
+          agentCapabilities: {
+            ...(this.kit.sessionResume ? { sessionCapabilities: { resume: {} } } : {}),
+            ...(this.kit.supportsImages ? { promptCapabilities: { image: true } } : {}),
+          },
         })
       }
       // agy's own start: spawn to initialize is ~0.25s warm, ~1s cold on Linux
@@ -452,6 +455,7 @@ export async function createBridgeKit(options = {}) {
     initializeDelayMs: options.initializeDelayMs ?? 0,
     initialized: 0,
     sessionResume: options.sessionResume ?? false,
+    supportsImages: options.supportsImages ?? false,
     agentVersion: options.agentVersion ?? "1.5.0",
     setModels: [],
     acpLog: [],
