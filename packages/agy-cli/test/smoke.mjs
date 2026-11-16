@@ -1402,7 +1402,7 @@ let nativeConv
   }
 
   const invalid = [
-    { type: "image", source: { type: "url", url: "https://example.invalid/image.png" } },
+    { type: "image", source: { type: "url", url: "file:///image.png" } },
     { ...image, source: { ...image.source, data: "" } },
     { ...image, source: { ...image.source, data: "not base64!" } },
     { ...image, source: { ...image.source, media_type: "application/pdf" } },

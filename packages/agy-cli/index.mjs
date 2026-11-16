@@ -5176,6 +5176,37 @@ function renderContinuedTurnParts(messages) {
   return renderTurnMessagesParts(messages)
 }
 
+// Like URL documents, URL images remain explicitly unread links. The client
+// owns image retrieval; the bridge neither downloads nor caches image bytes.
+function imageURLText(value) {
+  if (typeof value !== "string") throw new UnsupportedContent("an invalid image URL")
+  let url
+  try { url = new URL(value) } catch { throw new UnsupportedContent("an invalid image URL") }
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+    throw new UnsupportedContent("an image URL other than http(s) without credentials")
+  }
+  return `[image URL: ${JSON.stringify(value.trim())}; its content is not attached here and has not been read. Use an available image-viewing or image-analysis tool, following its documented arguments, to answer the visual question as text rather than return another image. Prefer the local file path if already known; otherwise use this URL. If a text-analysis call returns another unread image, use accompanying text or report that it could not be read instead of calling again. If no tool can read it, say so; do not guess its contents.]`
+}
+
+function describeURLImages(body) {
+  if (!Array.isArray(body?.messages)) return
+  for (const message of body.messages) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue
+    const describe = parts => parts.map(part => {
+      if (part?.type === "image" && part.source?.type === "url") {
+        return { type: "text", text: imageURLText(part.source.url) }
+      }
+      return part
+    })
+    message.content = describe(message.content).map(block => {
+      if (block?.type === "tool_result" && Array.isArray(block.content)) {
+        return { ...block, content: describe(block.content) }
+      }
+      return block
+    })
+  }
+}
+
 function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")
@@ -5351,6 +5382,7 @@ function inspectToolTurn(results, body) {
   const nonUserSourceNotice = /^\[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT\]\s*\n/
   const skillCompanion = /^\s*(?:Base directory for this skill:|ARGUMENTS:|Skill arguments:) /
   const imageCompanion = /^\[Image(?: source)?: [^\r\n]+\]$/
+  const unreadImage = /^\[image URL: "[^\r\n]+"; its content is not attached here .+ do not guess its contents\.\]$/
   const toolLoadedCompanion = /^Tools? loaded\.(?:\n\[id:[^\]\n]+\])*$/
   const loopNotice = /^\[\d+ prior \/loop wakeups? found nothing actionable; loop is healthy\.\]$/
   const tokenNoise = /^(?:<total_tokens>[^<]*<\/total_tokens>|Token usage: \S+; \S+ remaining|USD budget: \$\S+; \$\S+ remaining|Output tokens \u2014 turn: [^\r\n]+)$/
@@ -5390,9 +5422,13 @@ function inspectToolTurn(results, body) {
       }
       const trimmed = text.trim()
       if (!trimmed) continue
+      if (seenResult && message.role === "user" && unreadImage.test(trimmed)) {
+        out = appendResultText(out, resultIndex, trimmed)
+        continue
+      }
       const preceding = out[resultIndex]
       const skillIndex = preceding && isSkillResult(preceding) ? resultIndex : -1
-      const imageIndex = preceding?.result?.content?.some(part => part?.type === "image") ? resultIndex : -1
+      const imageIndex = preceding?.result?.content?.some(part => part?.type === "image" || unreadImage.test(part?.text || "")) ? resultIndex : -1
       const toolSearchIndex = preceding?.call?.name === "ToolSearch" ? resultIndex : -1
       if (message.role === "user" && skillCompanion.test(text)) {
         out = appendResultText(out, skillIndex, text)
@@ -6574,6 +6610,7 @@ export const AntigravityBridgePlugin = async () => {
                 ? (typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body))
                 : (typeof fetchInput?.text === "function" ? await fetchInput.text() : "")
               body = JSON.parse(raw)
+              describeURLImages(body)
               validateBody(body)
             } catch (error) {
               return jsonError(error.statusCode ?? 400, error.message)
@@ -6868,4 +6905,3 @@ process.once("exit", reapOnExit)
 
 export { sanitizeInputSchema }
 export default { id: PROVIDER_ID, server: AntigravityBridgePlugin }
-

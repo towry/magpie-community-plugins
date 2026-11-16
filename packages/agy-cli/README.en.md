@@ -85,6 +85,18 @@ MCP server. The control port listens on loopback only, with a token per process.
   newer, because the ACP server has to advertise image support. An image a tool
   returns (a screenshot from `read`) goes to agy as a prompt image too: over MCP,
   agy would save it to a file the model can't open.
+  **Fork experiment**: HTTP(S) image URLs become explicitly unread text links,
+  like URL documents; the plugin does not download or cache them. The note asks
+  the model to use an available image-viewing or image-analysis tool, following
+  that tool's documented arguments; it names no specific tool or parameter.
+  For example, in Amp, `view_media` with `path`
+  and `objective` returns text; omitting `objective` can return another URL image
+  and repeat the fallback. The note preserves a known local path and asks the
+  model to stop if a text-analysis call still returns an unread image.
+  Without a suitable tool, the image remains unread. New visual details can need
+  further tool calls: the main model receives analysis, not pixels. Session
+  matching uses the complete URL, including its query, rather than image bytes.
+  This replaces this fork's downloader, not the existing inline-image path.
 - **Tool calls**: parallel and consecutive calls both work. A tool that runs past
   150 seconds first gets a "still running" placeholder; once the real result
   arrives, the same turn continues, and the client executes each call exactly once.
@@ -333,8 +345,9 @@ off unless you turn it on.
 - **Usage shows "Limits not available" or a version error**: that window has no
   measurable data. For a version error, upgrade agy to 1.1.11 or later.
 - **Image requests return HTTP 400**: the running agy does not advertise image
-  support (1.5.0 or later is needed). Only inline base64 is accepted; image URLs
-  are rejected.
+  support for inline images (1.5.0 or later is needed), or the image source is
+  invalid. URL images are text links in this fork experiment; whether their
+  contents can be read depends on the client's image-analysis tool and URL access.
 - **Documents**: agy reads text and images only. A text document (plain text,
   base64 text/JSON/XML) goes as its text, and a URL document goes as its URL,
   for the model to fetch with a tool. A PDF read by a tool reaches the model as
