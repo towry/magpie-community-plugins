@@ -904,6 +904,33 @@ test("A16: under a tight budget, a mid-loop user steer beats an opening meta com
   })
 })
 
+// #896: agy reports the run to its vendor unless it is told not to; the flag
+// is passed only to an agy whose own acp --help lists it.
+const TELEMETRY_HELP = "Usage of acp:\n  --disable-telemetry\n    \tdisable telemetry (default false)\n"
+
+test("#896: an agy whose acp --help lists --disable-telemetry starts with telemetry off", async () => {
+  await withKit({ acpHelp: TELEMETRY_HELP }, async (kit) => {
+    scriptedAgent(kit)
+    const reply = await readSse(await kit.request(baseBody({ metadata: { user_id: "telemetry-listed" },
+      messages: [{ role: "user", content: "hello" }] })))
+    assert.equal(reply.stopReason, "end_turn")
+    assert.equal(kit.acpSpawns.length, 1)
+    assert.ok(kit.acpSpawns[0].args.includes("--disable-telemetry"), kit.acpSpawns[0].args.join(" "))
+  })
+})
+
+test("#896: an agy without the flag is never given it, and AGY_BRIDGE_TELEMETRY=1 keeps agy's own default", async () => {
+  for (const options of [{}, { acpHelp: TELEMETRY_HELP, env: { AGY_BRIDGE_TELEMETRY: "1" } }]) {
+    await withKit(options, async (kit) => {
+      scriptedAgent(kit)
+      const reply = await readSse(await kit.request(baseBody({ metadata: { user_id: "telemetry-unlisted" },
+        messages: [{ role: "user", content: "hello" }] })))
+      assert.equal(reply.stopReason, "end_turn")
+      assert.ok(!kit.acpSpawns[0].args.includes("--disable-telemetry"), kit.acpSpawns[0].args.join(" "))
+    })
+  }
+})
+
 // ----------------------------------------------- agy's error marker (#1052)
 
 function markerAgent(kit, chunks) {
@@ -984,6 +1011,46 @@ test("#1124: the model quoting the retry banner mid-line keeps it", async () => 
   await withKit({}, async (kit) => {
     markerAgent(kit, chunks)
     const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "retry-quoted" },
+      messages: [{ role: "user", content: "what did agy print?" }] })))
+    assert.equal(parsed.error, null)
+    assert.equal(replyText(parsed), chunks.join(""))
+  })
+})
+
+// #892: agy's output cap, as it reaches the reply: agy's three-line notice and
+// then the model's answer, still in the same turn.
+const CAP_HEAD = "\n⚠ Your previous response was cut off because it exceeded the output token limit\n"
+const CAP_TAIL = "Please continue from where you left off, keeping your response shorter\n"
+const CAP_RETRIES = "Retries remaining: 3\n"
+const CAP_NOTICE = CAP_HEAD + CAP_TAIL + CAP_RETRIES
+
+test("#892: agy's output-cap notice never reaches the client", async () => {
+  const answer = "the rest of the answer"
+  for (const [chunks, want] of [
+    [[CAP_NOTICE + answer], answer],
+    [[CAP_NOTICE, answer], answer],
+    [[CAP_HEAD.slice(0, 20), CAP_HEAD.slice(20) + CAP_TAIL, CAP_RETRIES, answer], answer],
+    [[CAP_NOTICE.slice(0, 150), CAP_NOTICE.slice(150) + answer], answer],
+    [[CAP_HEAD, answer], answer],
+    [[CAP_NOTICE], ""],
+    [[CAP_HEAD + answer], answer],
+  ]) {
+    await withKit({}, async (kit) => {
+      markerAgent(kit, chunks)
+      const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "cap-notice" },
+        messages: [{ role: "user", content: "write the long answer" }] })))
+      assert.equal(parsed.error, null)
+      assert.equal(parsed.stopReason, "end_turn")
+      assert.equal(replyText(parsed), want)
+    })
+  }
+})
+
+test("#892: the model quoting the output-cap notice mid-line keeps it", async () => {
+  const chunks = ["agy prints `⚠ Your previous response was cut off because it exceeded the output token limit`", " when it retries."]
+  await withKit({}, async (kit) => {
+    markerAgent(kit, chunks)
+    const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "cap-quoted" },
       messages: [{ role: "user", content: "what did agy print?" }] })))
     assert.equal(parsed.error, null)
     assert.equal(replyText(parsed), chunks.join(""))
@@ -1139,6 +1206,73 @@ test("the model quoting the Verification Required ending with more text after ke
     assert.equal(parsed.error, null)
     assert.equal(replyText(parsed), chunks.join(""))
   })
+})
+
+// @Airan_FS on X (11-17): an account out of its own quota got agy's
+// ending as the whole reply, and magpie never asked the next account. The
+// line is Google's words with the time until the quota is back.
+const QUOTA_LINE = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h18m40s."
+const QUOTA = "\n" + QUOTA_LINE + "\n"
+
+test("agy's Individual quota reached ending fails the turn as a rate limit with its reset", async () => {
+  for (const chunks of [
+    [QUOTA],
+    [QUOTA.slice(0, 12), QUOTA.slice(12, 40), QUOTA.slice(40)],
+    [QUOTA_LINE],
+    ["\n⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 6d2h."],
+  ]) {
+    await withKit({}, async (kit) => {
+      markerAgent(kit, chunks)
+      const response = await kit.request(baseBody({ metadata: { user_id: "quota-end" },
+        messages: [{ role: "user", content: "hello" }] }))
+      const text = await response.text()
+      const error = sseError(text)
+      assert.equal(error.type, "rate_limit_error")
+      assert.equal(error.message, "agy bridge: Antigravity quota reached: " + chunks.join("").trim().replace(/^⚠ /, ""))
+      assert.ok(!text.includes("⚠"), "no banner reaches the client")
+      assert.ok(!text.includes("text_delta"), "nothing of it went as the reply")
+    })
+  }
+})
+
+test("agy's Individual quota reached ending after words the model wrote keeps them and fails the turn", async () => {
+  await withKit({}, async (kit) => {
+    markerAgent(kit, ["Let me look", QUOTA.slice(0, 30), QUOTA.slice(30)])
+    const response = await kit.request(baseBody({ metadata: { user_id: "quota-partial" },
+      messages: [{ role: "user", content: "hello" }] }))
+    const text = await response.text()
+    const parsed = await readSse(new Response(text))
+    assert.equal(replyText(parsed), "Let me look")
+    assert.equal(sseError(text).type, "rate_limit_error")
+    assert.match(sseError(text).message, /Resets in 1h18m40s\.$/)
+  })
+})
+
+test("agy's Individual quota reached ending fails a non-stream request as an HTTP 429", async () => {
+  await withKit({}, async (kit) => {
+    markerAgent(kit, [QUOTA])
+    const response = await kit.request(baseBody({ metadata: { user_id: "quota-json" },
+      messages: [{ role: "user", content: "hello" }], stream: false }))
+    const body = await response.json()
+    assert.equal(response.status, 429)
+    assert.equal(body.error.type, "rate_limit_error")
+    assert.match(body.error.message, /Individual quota reached\. .*Resets in 1h18m40s\./)
+  })
+})
+
+test("the model quoting the Individual quota reached ending with more text after keeps it", async () => {
+  for (const chunks of [
+    ["agy said\n⚠ Individual quota", " reached. Please upgrade. Resets in 1h.\nThat line is agy's, not mine."],
+    ["agy prints `⚠ Individual quota reached. Resets in 1h.` when it is out."],
+  ]) {
+    await withKit({}, async (kit) => {
+      markerAgent(kit, chunks)
+      const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "quota-quoted" },
+        messages: [{ role: "user", content: "what did agy print?" }] })))
+      assert.equal(parsed.error, null)
+      assert.equal(replyText(parsed), chunks.join(""))
+    })
+  }
 })
 
 test("#1151: the model quoting the 429 ending with more text after keeps it", async () => {

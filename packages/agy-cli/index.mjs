@@ -8,7 +8,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { agyRefusal, createUsageReader, verifyLinkIn, verifyRefused } from "./usage.mjs"
-import { storeCatalogRows } from "./model-ids.mjs"
+import { catalogRows, storeCatalogRows } from "./model-ids.mjs"
 import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, storedEmail, storedSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
@@ -98,6 +98,7 @@ const NO_PROGRESS_REPEAT_WINDOW_MS = 10 * 60 * 1000
 const NO_PROGRESS_REPEAT_MAX_ENTRIES = 256
 const POOL_PRESSURE_NOTE = "agy bridge: this tool call was closed to free an agy process for another conversation; stop this turn"
 const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
+const DROPPED_NOTE = "agy bridge: cancelled by the client, not executed; the conversation continues with the next message"
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
 const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
 // A conflict retrying can never fix: SDKs that honour this header (Anthropic
@@ -131,6 +132,15 @@ const AGENT_ERROR_MARKERS = [
   "\n⚠ Verification Required\n",
 ]
 const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
+// agy's ending for an account whose own quota is used up, with Google's
+// time until it is back on the same line: "⚠ Individual quota reached.
+// Please upgrade your subscription to increase your limits. Resets in
+// 1h18m40s." Its tail changes, so it is matched by its start, as a line of
+// its own that nothing follows. Answered as text, it was the whole reply
+// and the next account was never asked (@Airan_FS on X, 11-17).
+const QUOTA_CORE = "⚠ Individual quota reached"
+const QUOTA_MARKER = "\n" + QUOTA_CORE
+const quotaReached = (detail) => /\bindividual quota reached\b/i.test(detail || "")
 const CREDITS_CORE = AGENT_ERROR_CORES[2]
 const VERIFY_CORE = AGENT_ERROR_CORES[5]
 // agy 1.5.8 writes each failed attempt of a model call into the reply as one
@@ -149,7 +159,19 @@ const refused429 = (detail) => /code 429\b/i.test(detail) && /resource has been 
 // It is agy's, not the model's, and the turn goes on (#1124).
 const RETRY_MARKER = "\n⚠ Model produced invalid output.\n"
 const RETRY_CORE = RETRY_MARKER.trim()
-const HOLD_MAX = Math.max(...AGENT_ERROR_MARKERS.map((marker) => marker.length)) - 1
+// agy's own output-cap retry reaches the reply as three lines of its own:
+// what happened, its instruction to continue, and the retries left. The
+// model's answer goes on after them in the same turn, so the notice is agy's
+// and is dropped (#892). Wording as observed by lili-luo/dsh-plugin-bundle
+// (dsh-llm-antigravity-acp, MIT).
+const CAP_MARKER = "\n⚠ Your previous response was cut off because it exceeded the output token limit\n"
+const CAP_CORE = CAP_MARKER.trim()
+const CAP_TAIL_CORE = "Please continue from where you left off, keeping your response shorter"
+const CAP_RETRIES_CORE = "Retries remaining: "
+const CAP_RETRIES_LINE = /^Retries remaining: ?\d+\.?$/
+const HOLD_MAX = Math.max(
+  ...AGENT_ERROR_MARKERS.map((marker) => marker.length), CAP_MARKER.length, CAP_TAIL_CORE.length, QUOTA_MARKER.length,
+) - 1
 // Opt-in. The minimal agent drops agy's own prompt components (~8,400 input
 // tokens a model call, against ~500 without them), so the request goes upstream
 // with the client's system prompt in their place.
@@ -297,6 +319,17 @@ export async function modelsArgs(agyPath) {
 
 export function noDefaultCustomizationsArgs(agyPath) {
   return acpHelp(agyPath).then((help) => (/--include-default-customizations\b/.test(help) ? ["--include-default-customizations=false"] : []))
+}
+
+// agy reports the run to its vendor unless it is told not to. The bridge turns
+// that off by default, as a privacy setting rather than a workaround: what the
+// user types here is the client's business and agy's vendor's logs are not the
+// place it lands. Passed only when `agy acp --help` lists the flag, since an
+// agy without it refuses to start on it; AGY_BRIDGE_TELEMETRY=1 keeps agy's
+// own default for anyone who wants the vendor's diagnostics.
+export function telemetryArgs(agyPath, env = process.env) {
+  if (/^(?:1|true|on|yes|enabled)$/i.test(env.AGY_BRIDGE_TELEMETRY || "")) return Promise.resolve([])
+  return acpHelp(agyPath).then((help) => (/--disable[-_]telemetry\b/.test(help) ? ["--disable-telemetry"] : []))
 }
 
 // The bridge's own agy folder, kept across restarts so agy finds a
@@ -464,7 +497,7 @@ async function probeSignedIn(agy) {
     if (list) {
       useAgyPath(agy)
       storeListedCatalog(agy, list, Date.now())
-      wantOfferedProbe = true
+      ms().wantOfferedProbe = true
       await briefly(probeOfferedOnce(agy), OFFERED_SIGNIN_WAIT_MS)
     }
     return { ok: true }
@@ -486,18 +519,44 @@ const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000
 const MODEL_CATALOG_FAST_WAIT_MS = 500
 const MODEL_CATALOG_RETRY_MS = 5_000
-let modelCatalogRefreshPromise = null
-let cachedModelCatalog = fallbackModelCatalog()
-// A caller lists models (provider.models), so a listing that lands asks agy
-// acp what it offers right away, not on the next models() call (#1064).
-let wantOfferedProbe = false
 
-// `agy models` lists every model of the account, while agy's ACP server offers
-// a client only some of them. A session's model option (and its
-// models.availableModels) says which; the catalog keeps to that. Before any
-// session has said, only Gemini models are served.
-let acpOfferedModels = null
-let acpOfferedKey = ""
+// What is learnt of the models is each account's own (#1229): accounts on
+// different plans list and are offered different models, so one account's
+// session no longer changes what another lists. magpie asks every
+// account's models() in that account (inAccount), serves their union, and
+// sends a request for a model only to an account that lists it.
+//
+// - cachedModelCatalog: the last `agy models` list (static until one).
+// - modelCatalogRefreshPromise: the listing running now.
+// - wantOfferedProbe: a caller lists models (provider.models), so a listing
+//   that lands asks agy acp what it offers right away, not on the next
+//   models() call (#1064).
+// - acpOfferedModels, acpOfferedKey: `agy models` lists every model of the
+//   account, while agy's ACP server offers a client only some of them. A
+//   session's model option (and its models.availableModels) says which;
+//   the catalog keeps to that. Before any session has said, only Gemini
+//   models are served.
+// - offeredProbePromise, offeredProbeAt, offeredGen: the probe below.
+const modelStates = new Map()
+
+function ms() {
+  const home = currentHome() ?? ""
+  let state = modelStates.get(home)
+  if (!state) {
+    state = {
+      cachedModelCatalog: fallbackModelCatalog(),
+      modelCatalogRefreshPromise: null,
+      wantOfferedProbe: false,
+      acpOfferedModels: null,
+      acpOfferedKey: "",
+      offeredProbePromise: null,
+      offeredProbeAt: null,
+      offeredGen: 0,
+    }
+    modelStates.set(home, state)
+  }
+  return state
+}
 
 function offeredModelsOf(configOptions, models) {
   const out = []
@@ -515,23 +574,23 @@ function noteOfferedModels(configOptions, models) {
   if (!offered.length) return
   const names = new Map(offered.map(model => [model.id, typeof model.name === "string" && model.name ? model.name : model.id]))
   const key = [...names.keys()].sort().join("\n")
-  if (key === acpOfferedKey) return
-  acpOfferedModels = names
-  acpOfferedKey = key
-  if (cachedModelCatalog?.agyPath) saveCatalog(cachedModelCatalog.agyPath, { offered: [...names].map(([id, name]) => ({ id, name })) })
+  if (key === ms().acpOfferedKey) return
+  ms().acpOfferedModels = names
+  ms().acpOfferedKey = key
+  if (ms().cachedModelCatalog?.agyPath) saveCatalog(ms().cachedModelCatalog.agyPath, { offered: [...names].map(([id, name]) => ({ id, name })) })
 }
 
 // A model the session offers that `agy models` did not list is served as is.
 function withOffered(list) {
-  if (!acpOfferedModels) return list
+  if (!ms().acpOfferedModels) return list
   const covered = new Set(list.flatMap(model => [model.id, modelFamilyId(model)]))
-  return [...list, ...[...acpOfferedModels].filter(([id]) => !covered.has(id)).map(([id, name]) => ({ id, name }))]
+  return [...list, ...[...ms().acpOfferedModels].filter(([id]) => !covered.has(id)).map(([id, name]) => ({ id, name }))]
 }
 
 function offeredFilter(list) {
-  if (!acpOfferedModels) return list.filter(model => /^gemini-/i.test(model.id))
-  return withOffered(list.filter(model => acpOfferedModels.has(model.id) ||
-    (modelFamilyId(model) && acpOfferedModels.has(modelFamilyId(model)))))
+  if (!ms().acpOfferedModels) return list.filter(model => /^gemini-/i.test(model.id))
+  return withOffered(list.filter(model => ms().acpOfferedModels.has(model.id) ||
+    (modelFamilyId(model) && ms().acpOfferedModels.has(modelFamilyId(model)))))
 }
 
 // Before any request has opened a session, ask agy itself: a short `agy acp`
@@ -540,19 +599,16 @@ function offeredFilter(list) {
 // yulong-ge's antigravity-official-acp (#854).
 const OFFERED_PROBE_TIMEOUT_MS = 30_000
 const OFFERED_PROBE_RETRY_MS = 60_000
-let offeredProbePromise = null
-let offeredProbeAt = null
 // Bumped when what was learnt about an agy no longer holds (another
 // executable, a new sign-in): a probe still running for the old one is
 // not believed.
-let offeredGen = 0
 
 function forgetOffered() {
-  acpOfferedModels = null
-  acpOfferedKey = ""
-  offeredProbePromise = null
-  offeredProbeAt = null
-  offeredGen++
+  ms().acpOfferedModels = null
+  ms().acpOfferedKey = ""
+  ms().offeredProbePromise = null
+  ms().offeredProbeAt = null
+  ms().offeredGen++
 }
 
 // briefly waits for a promise at most ms, and never throws.
@@ -577,7 +633,9 @@ function killQuietly(child) {
 }
 
 async function probeOfferedModels(agyPath) {
-  const gen = offeredGen
+  const state = ms()
+  const home = currentHome()
+  const gen = state.offeredGen
   let workspace = null
   let child = null
   let conn = null
@@ -606,7 +664,7 @@ async function probeOfferedModels(agyPath) {
       })
       if (agyTooOld(init?.agentInfo?.version ?? null)) return
       const session = await conn.request("session/new", { cwd: workspace, mcpServers: [] })
-      if (gen === offeredGen) noteOfferedModels(session?.configOptions, session?.models)
+      if (gen === state.offeredGen) inAccount(home, () => noteOfferedModels(session?.configOptions, session?.models))
       const caps = init?.agentCapabilities ?? {}
       if (session?.sessionId && (caps.sessionCapabilities?.close ?? caps.session_capabilities?.close)) {
         await conn.request("session/close", { sessionId: session.sessionId }).catch(() => {})
@@ -623,24 +681,24 @@ async function probeOfferedModels(agyPath) {
 }
 
 function probeOfferedOnce(agyPath) {
-  if (acpOfferedModels || offeredProbePromise) return offeredProbePromise
+  if (ms().acpOfferedModels || ms().offeredProbePromise) return ms().offeredProbePromise
   const now = Date.now()
-  if (offeredProbeAt !== null && now - offeredProbeAt < OFFERED_PROBE_RETRY_MS) return null
-  offeredProbeAt = now
+  if (ms().offeredProbeAt !== null && now - ms().offeredProbeAt < OFFERED_PROBE_RETRY_MS) return null
+  ms().offeredProbeAt = now
   const probe = probeOfferedModels(agyPath).finally(() => {
-    if (offeredProbePromise === probe) offeredProbePromise = null
+    if (ms().offeredProbePromise === probe) ms().offeredProbePromise = null
   })
-  offeredProbePromise = probe
+  ms().offeredProbePromise = probe
   return probe
 }
 
 function catalogOf(entry) {
-  if (entry.offeredKey !== acpOfferedKey || !entry.catalog) {
+  if (entry.offeredKey !== ms().acpOfferedKey || !entry.catalog) {
     entry.catalog = buildModelCatalog(offeredFilter(entry.list))
     // A request is routed by every model agy lists: the first request for a
     // model comes before any session has said what it offers.
     entry.catalog.routing = buildModelCatalog(withOffered(entry.list))
-    entry.offeredKey = acpOfferedKey
+    entry.offeredKey = ms().acpOfferedKey
   }
   return entry.catalog
 }
@@ -726,9 +784,10 @@ function buildModelCatalog(list) {
   return { models, routes, rawIds }
 }
 
-function fallbackModelCatalog(agyPath = null) {
-  // The usage reader names ids on its windows from the catalog being served.
-  storeCatalogRows(FALLBACK_MODELS)
+function fallbackModelCatalog(agyPath = null, { replace = false } = {}) {
+  // The usage reader names ids on its windows from the catalog being served;
+  // a new account's static start doesn't replace another account's real list.
+  if (replace || !catalogRows()) storeCatalogRows(FALLBACK_MODELS)
   return { agyPath, list: FALLBACK_MODELS, catalog: null, offeredKey: null, isFallback: true, fetchedAt: 0, lastAttemptAt: null }
 }
 
@@ -742,6 +801,14 @@ function modelCatalogFile() {
   return path.join(path.dirname(sessionStateFile()), "models.json")
 }
 
+// catalogKey is the account's entry for agyPath in models.json: agy's own
+// account keeps the executable's path as before, another account adds its
+// home (#1229).
+function catalogKey(agyPath) {
+  const home = currentHome()
+  return home ? `${agyPath}#${path.basename(home)}` : agyPath
+}
+
 function validModelRow(row) {
   return row && typeof row.id === "string" && /^\S+$/.test(row.id) && typeof row.name === "string" &&
     (row.effort === undefined || EFFORT_ORDER.includes(row.effort))
@@ -751,7 +818,7 @@ function readSavedCatalog(agyPath) {
   if (!agyPath) return null
   try {
     const data = JSON.parse(fs.readFileSync(modelCatalogFile(), "utf8"))
-    const entry = data?.version === 1 && data.byAgy && Object.hasOwn(data.byAgy, agyPath) ? data.byAgy[agyPath] : null
+    const entry = data?.version === 1 && data.byAgy && Object.hasOwn(data.byAgy, catalogKey(agyPath)) ? data.byAgy[catalogKey(agyPath)] : null
     if (!entry || !Number.isFinite(entry.at) || Date.now() - entry.at > SAVED_CATALOG_MAX_AGE_MS) return null
     // A half-written or hand-edited file means "unknown": the fallback serves.
     if (!Array.isArray(entry.list) || !entry.list.length || !entry.list.every(validModelRow)) return null
@@ -781,11 +848,12 @@ function saveCatalog(agyPath, change) {
         const data = JSON.parse(fs.readFileSync(file, "utf8"))
         if (data?.version === 1 && data.byAgy && typeof data.byAgy === "object") byAgy = data.byAgy
       } catch {}
-      const entry = { ...(byAgy[agyPath] || {}), at: Date.now() }
+      const key = catalogKey(agyPath)
+      const entry = { ...(byAgy[key] || {}), at: Date.now() }
       if (change.list) entry.list = change.list.map(savedRow)
       if (change.offered) entry.offered = change.offered
       if (!Array.isArray(entry.list)) return
-      byAgy[agyPath] = entry
+      byAgy[key] = entry
       const temp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
       fs.writeFileSync(temp, JSON.stringify({ version: 1, byAgy }) + "\n", { mode: 0o600 })
       fs.renameSync(temp, file)
@@ -795,11 +863,11 @@ function saveCatalog(agyPath, change) {
 
 function startingModelCatalog(agyPath) {
   const saved = readSavedCatalog(agyPath)
-  if (!saved) return fallbackModelCatalog(agyPath)
+  if (!saved) return fallbackModelCatalog(agyPath, { replace: true })
   // What agy acp offered last time, until a session of this run says.
-  if (saved.offered && !acpOfferedModels) {
-    acpOfferedModels = new Map(saved.offered.map(({ id, name }) => [id, name]))
-    acpOfferedKey = [...acpOfferedModels.keys()].sort().join("\n")
+  if (saved.offered && !ms().acpOfferedModels) {
+    ms().acpOfferedModels = new Map(saved.offered.map(({ id, name }) => [id, name]))
+    ms().acpOfferedKey = [...ms().acpOfferedModels.keys()].sort().join("\n")
   }
   // The usage reader names ids on its windows from the catalog being served.
   storeCatalogRows(saved.list)
@@ -809,18 +877,18 @@ function startingModelCatalog(agyPath) {
 // useAgyPath starts over when the executable changes: an old executable's
 // dynamic additions and offer must not route to, or list for, a new one.
 function useAgyPath(agyPath) {
-  if (cachedModelCatalog.agyPath === agyPath) return
+  if (ms().cachedModelCatalog.agyPath === agyPath) return
   // The first agy this process finds is not a change of one.
-  if (cachedModelCatalog.agyPath !== null) forgetOffered()
-  cachedModelCatalog = startingModelCatalog(agyPath)
-  modelCatalogRefreshPromise = null
+  if (ms().cachedModelCatalog.agyPath !== null) forgetOffered()
+  ms().cachedModelCatalog = startingModelCatalog(agyPath)
+  ms().modelCatalogRefreshPromise = null
 }
 
 function storeListedCatalog(agyPath, list, lastAttemptAt) {
   saveCatalog(agyPath, { list })
   // The usage reader names ids on its windows from the catalog being served.
   storeCatalogRows(list)
-  cachedModelCatalog = {
+  ms().cachedModelCatalog = {
     agyPath,
     list,
     catalog: null,
@@ -836,10 +904,12 @@ function storeListedCatalog(agyPath, list, lastAttemptAt) {
 // is none. Hosts that read the list once (OpenCode 2.x's adapter) read it
 // again when this ends.
 function catalogWarming() {
-  if (!modelCatalogRefreshPromise && !offeredProbePromise) return null
+  // every account's: the host reading the list is in no account's scope
+  // A listing that lands starts the probe, so look again after each wait.
+  const pending = () => [...modelStates.values()].flatMap(state => [state.modelCatalogRefreshPromise, state.offeredProbePromise]).find(Boolean)
+  if (!pending()) return null
   return (async () => {
-    if (modelCatalogRefreshPromise) await modelCatalogRefreshPromise.catch(() => {})
-    if (offeredProbePromise) await offeredProbePromise.catch(() => {})
+    for (let promise; (promise = pending());) await promise.catch(() => {})
     return true
   })()
 }
@@ -851,8 +921,8 @@ function catalogWarming() {
 // request that is about to open a session of its own.
 async function loadModelCatalog(agyPath, { probeOffered = false } = {}) {
   useAgyPath(agyPath)
-  if (probeOffered) wantOfferedProbe = true
-  const current = cachedModelCatalog
+  if (probeOffered) ms().wantOfferedProbe = true
+  const current = ms().cachedModelCatalog
   if (!agyPath) return catalogOf(current)
   const now = Date.now()
   if (!current.isFallback && now - current.fetchedAt < MODEL_CATALOG_TTL_MS) {
@@ -860,28 +930,28 @@ async function loadModelCatalog(agyPath, { probeOffered = false } = {}) {
     if (probeOffered) probeOfferedOnce(agyPath)
     return catalogOf(current)
   }
-  if (!modelCatalogRefreshPromise &&
+  if (!ms().modelCatalogRefreshPromise &&
       (current.lastAttemptAt === null || now - current.lastAttemptAt >= MODEL_CATALOG_RETRY_MS)) {
     current.lastAttemptAt = now
     const refresh = listAgyModels(agyPath).then((list) => {
-      if (list?.length && cachedModelCatalog === current) {
+      if (list?.length && ms().cachedModelCatalog === current) {
         storeListedCatalog(agyPath, list, current.lastAttemptAt)
         // `agy models` answered, so agy is signed in: ask what agy acp
         // offers now, while the host still waits for its first list.
-        if (wantOfferedProbe) probeOfferedOnce(agyPath)
+        if (ms().wantOfferedProbe) probeOfferedOnce(agyPath)
       }
     }).catch(() => {
       // Keep the last successful catalog, including dynamic-only models.
     }).finally(() => {
-      if (modelCatalogRefreshPromise === refresh) modelCatalogRefreshPromise = null
+      if (ms().modelCatalogRefreshPromise === refresh) ms().modelCatalogRefreshPromise = null
     })
-    modelCatalogRefreshPromise = refresh
+    ms().modelCatalogRefreshPromise = refresh
   }
-  if (modelCatalogRefreshPromise) {
+  if (ms().modelCatalogRefreshPromise) {
     let timer
     try {
       await Promise.race([
-        modelCatalogRefreshPromise,
+        ms().modelCatalogRefreshPromise,
         new Promise((resolve) => { timer = setTimeout(resolve, MODEL_CATALOG_FAST_WAIT_MS) }),
       ])
     } finally {
@@ -891,9 +961,9 @@ async function loadModelCatalog(agyPath, { probeOffered = false } = {}) {
   // `agy models` answered, so agy is signed in: learn what its ACP server
   // offers this client, waiting for it as briefly as for the listing.
   // A saved list (fetchedAt 0) is not an answer from this agy yet.
-  const probe = probeOffered && !cachedModelCatalog.isFallback && cachedModelCatalog.fetchedAt > 0 ? probeOfferedOnce(agyPath) : null
+  const probe = probeOffered && !ms().cachedModelCatalog.isFallback && ms().cachedModelCatalog.fetchedAt > 0 ? probeOfferedOnce(agyPath) : null
   if (probe) await briefly(probe, MODEL_CATALOG_FAST_WAIT_MS)
-  return catalogOf(cachedModelCatalog)
+  return catalogOf(ms().cachedModelCatalog)
 }
 
 function modelLimits(id) {
@@ -1400,6 +1470,7 @@ class Turn {
     this.heldText = ""
     this.textTail = ""
     this.openBanner = -1
+    this.capPending = false
     this.attemptDetail = ""
     this.refusedDetail = ""
     this.agentErrorCore = ""
@@ -1576,7 +1647,7 @@ class Turn {
   // Withholds agy's error marker, or a possible prefix of it, until it can be
   // classified. agy's own marker ends the prompt; one that more text follows
   // was the model quoting it (#1052). agy's retry banners are dropped where
-  // they start a line (#1124, #1136); one whose line hasn't ended is held.
+  // they start a line (#1124, #1136, #892); one whose line hasn't ended is held.
   pushText(chunk) {
     if (this.done || this.agentError) return
     this.pushHeld(chunk)
@@ -1603,10 +1674,17 @@ class Turn {
         return
       }
     }
+    const quota = this.quotaEnding(text)
+    if (quota >= 0) {
+      this.heldText = text.slice(quota)
+      this.emitText(text.slice(0, quota))
+      return
+    }
     for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
-      if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) ||
-        (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail)))) {
+      if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) || QUOTA_MARKER.startsWith(tail) ||
+        (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail) ||
+          CAP_MARKER.startsWith(tail)))) {
         this.heldText = tail
         text = text.slice(0, -keep)
         break
@@ -1615,15 +1693,41 @@ class Turn {
     this.emitText(text)
   }
 
+  // Where agy's quota ending (QUOTA_CORE) starts in text, with the newline
+  // before it: a line of its own that only whitespace follows, so far. -1
+  // when there is none; one more text follows was the model quoting it.
+  quotaEnding(text) {
+    const at = text.lastIndexOf(QUOTA_CORE)
+    if (at < 0) return -1
+    const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
+    if (!lineStart || text.slice(at).trimEnd().includes("\n")) return -1
+    return at > 0 ? at - 1 : at
+  }
+
   // Removes agy's retry banners, each with its leading and one trailing
-  // newline, wherever one starts a line. Text that only quotes one mid-line is
-  // kept. Until the turn's text is flushed, a banner that ends the buffer is
-  // left in place and openBanner says where, so pushText holds it and its
-  // newline in the next chunk goes with it.
+  // newline, wherever one starts a line: the one-line retry and attempt
+  // banners, and the three-line output-cap notice (#892). Text that only
+  // quotes one mid-line is kept. Until the turn's text is flushed, a banner
+  // that ends the buffer is left in place and openBanner says where, so
+  // pushText holds it and its newline in the next chunk goes with it.
   dropRetryBanner(text, final = false) {
     this.openBanner = -1
     let from = 0
     for (;;) {
+      if (this.capPending) {
+        const end = text.indexOf("\n", from)
+        const line = text.slice(from, end < 0 ? text.length : end)
+        if (CAP_RETRIES_LINE.test(line)) {
+          this.capPending = false
+          text = text.slice(0, from) + text.slice(end < 0 ? text.length : end + 1)
+          continue
+        }
+        if (!final && CAP_RETRIES_CORE.startsWith(line)) {
+          this.openBanner = from
+          return text
+        }
+        this.capPending = false
+      }
       const at = nextBanner(text, from)
       if (at < 0) return text
       const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
@@ -1632,6 +1736,20 @@ class Turn {
         continue
       }
       const start = at > 0 ? at - 1 : at
+      if (text.startsWith(CAP_CORE, at)) {
+        const cap = capNoticeEnd(text, at, final)
+        if (cap.end < 0) {
+          // agy's notice is still streaming: hold it with its lines' newlines
+          this.openBanner = start
+          return text
+        }
+        // The notice's "Retries remaining" line is its own line, so it can
+        // arrive in the next chunk after the two lines before it.
+        this.capPending = cap.retries
+        text = text.slice(0, start) + text.slice(cap.end)
+        from = start
+        continue
+      }
       const attempt = !text.startsWith(RETRY_CORE, at)
       let end = attempt ? text.indexOf("\n", at) : at + RETRY_CORE.length
       if (end < 0) end = text.length
@@ -1662,6 +1780,11 @@ class Turn {
     if (core) {
       this.agentError = true
       this.agentErrorCore = core
+      this.heldText = ""
+    } else if (this.quotaEnding(this.heldText) >= 0) {
+      this.agentError = true
+      this.agentErrorCore = QUOTA_CORE
+      this.quotaNotice = this.heldText.trim().replace(/^⚠ /, "")
       this.heldText = ""
     }
   }
@@ -1809,6 +1932,10 @@ class Turn {
 class Proc {
   constructor(agyPath, convKey, opts) {
     this.agyPath = agyPath
+    // the account this agy runs for: what its sessions offer is that
+    // account's, also when agy's output arrives outside the account's
+    // scope (#1229)
+    this.home = currentHome()
     this.#assign(convKey, opts)
     this.workDir = opts.workDir
     this.spareKey = null
@@ -1911,6 +2038,7 @@ class Proc {
     ]
     if (this.workDir) args.push("--add-dir", this.workDir)
     args.push(...await noDefaultCustomizationsArgs(this.agyPath))
+    args.push(...await telemetryArgs(this.agyPath))
     const own = await geminiDirArgs(this.agyPath)
     args.push(...own.args)
     // agy writes the conversation's steps under the folder it was given
@@ -2032,7 +2160,7 @@ class Proc {
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
-    noteOfferedModels(this.configOptions, session?.models)
+    inAccount(this.home, () => noteOfferedModels(this.configOptions, session?.models))
     if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
   }
@@ -2186,7 +2314,7 @@ class Proc {
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
       this.currentSelectionKey = null
-      noteOfferedModels(this.configOptions)
+      inAccount(this.home, () => noteOfferedModels(this.configOptions))
       return
     }
     const turn = this.turn
@@ -2419,6 +2547,11 @@ class Proc {
 
   async #agentError(turn) {
     const core = turn.agentErrorCore
+    if (core === QUOTA_CORE) {
+      // Google's own words, the reset with them: magpie rests the account
+      // until then and asks the next one
+      return new AgentTurnError(`agy bridge: Antigravity quota reached: ${turn.quotaNotice}`, "rate_limit_error")
+    }
     if (core === VERIFY_CORE) {
       // the link, when agy logged Google's error whole; the reply has none
       const logged = await logTail(this.logPath, turn.logOffset)
@@ -2444,7 +2577,7 @@ class Proc {
         "invalid_request_error",
       )
     }
-    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail)) {
+    if (/QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|code 429\b/i.test(detail) || quotaReached(detail)) {
       return new AgentTurnError(
         `agy bridge: Antigravity quota or rate limit reached${detail ? ": " + detail : ""}${refused429(detail) ? " — Antigravity answers this same bare 429 to a system prompt it turns away whatever quota is left, so if quota is left it is not a quota and waiting won't help: something in this agent's system prompt is being matched" : ""}`,
         "rate_limit_error",
@@ -2911,13 +3044,40 @@ async function lastAgentError(file, offset) {
   return found.trim().slice(0, 1000)
 }
 
+// Where agy's output-cap notice ends, given where it starts. The notice is its
+// notice line, its "please continue" instruction and its "Retries remaining"
+// count; a line that is neither is the model's and stays. -1 means the buffer
+// still ends inside the notice; `retries` says the count line is still owed.
+function capNoticeEnd(text, at, final) {
+  const lineAt = (from) => {
+    const end = text.indexOf("\n", from)
+    return { value: text.slice(from, end < 0 ? text.length : end), end }
+  }
+  let pos = text.indexOf("\n", at)
+  if (pos < 0) return { end: final ? text.length : -1, retries: false }
+  pos += 1
+  const tail = lineAt(pos)
+  if (tail.value === CAP_TAIL_CORE) {
+    if (tail.end < 0) return { end: final ? text.length : -1, retries: false }
+    pos = tail.end + 1
+  } else if (!final && CAP_TAIL_CORE.startsWith(tail.value)) {
+    return { end: -1, retries: false }
+  } else {
+    return { end: pos, retries: false }
+  }
+  const retries = lineAt(pos)
+  if (CAP_RETRIES_LINE.test(retries.value)) {
+    return { end: retries.end < 0 ? text.length : retries.end + 1, retries: false }
+  }
+  return { end: pos, retries: !final }
+}
+
 // Where the next retry banner of either kind starts, from `from` on.
 function nextBanner(text, from) {
-  const retry = text.indexOf(RETRY_CORE, from)
-  const attempt = text.indexOf(ATTEMPT_CORE, from)
-  if (retry < 0) return attempt
-  if (attempt < 0) return retry
-  return Math.min(retry, attempt)
+  const found = [RETRY_CORE, ATTEMPT_CORE, CAP_CORE]
+    .map((core) => text.indexOf(core, from))
+    .filter((at) => at >= 0)
+  return found.length ? Math.min(...found) : -1
 }
 
 function dropFromPool(proc) {
@@ -3159,7 +3319,7 @@ async function launchKey(agyPath, workDir) {
   try { mtime = (await fs.promises.stat(agyPath)).mtimeMs } catch {}
   const own = await geminiDirArgs(agyPath)
   return digest(JSON.stringify([currentHome(), agyPath, mtime, workDir || "",
-    await noDefaultCustomizationsArgs(agyPath), own.args, childEnv(process.env)]))
+    await noDefaultCustomizationsArgs(agyPath), await telemetryArgs(agyPath), own.args, childEnv(process.env)]))
 }
 
 function dropSpare(spare) {
@@ -3281,7 +3441,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     existing = null
   }
   if (existing && !existing.dead && existing.turn) {
-    const lineage = lineageVerdict(existing, existing.turn, opts)
+    let lineage = lineageVerdict(existing, existing.turn, opts)
+    if (lineage === "dropped") {
+      const held = existing.turn
+      const kept = await keepDroppedTurn(existing, held, opts)
+      logBridgeEvent(existing, held, kept ? "kept" : "keep_failed", "lineage_dropped", opts)
+      if (!kept) lineage = "fork"
+    }
     if (lineage === "fork" || lineage === "answered") {
       const orphan = existing.turn
       logBridgeEvent(existing, orphan, "superseded", lineage === "fork" ? "lineage_fork" : "lineage_answered", opts,
@@ -3540,7 +3706,33 @@ function lineageVerdict(proc, turn, opts) {
   if (!carried && !recorded && Array.isArray(expected) && expected.length > base.length &&
     history.length === expected.length &&
     historyKey(withoutInputs(history)) === historyKey(withoutInputs(expected))) return null
+  // Codex keeps the text of a reply it interrupts (a sub-agent's message at a
+  // sampling boundary) but drops the reply's tool calls, then sends on (#1231).
+  // The client's history is this session's with only the pending calls taken
+  // out, so the session can answer them as cancelled and go on, keeping its
+  // cached prefix, instead of replaying the conversation in a new one.
+  if (!carried && !recorded && !opts.hasToolResults && droppedPendingCalls(turn, expected, base, history)) return "dropped"
   return carried || recorded ? "conflict" : "fork"
+}
+
+// The recorded history with the turn's unanswered calls removed is exactly the
+// client's, and the reply that carried them kept something else (its text).
+function droppedPendingCalls(turn, expected, base, history) {
+  if (!Array.isArray(expected) || expected.length <= base.length || history.length !== expected.length) return false
+  const pending = new Set(turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => call.id))
+  if (!pending.size) return false
+  let removed = 0
+  const stripped = expected.map((message) => {
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return message
+    const content = message.content.filter((block) => !(block?.type === "tool_use" && pending.has(block.id)))
+    removed += message.content.length - content.length
+    return { ...message, content }
+  })
+  if (removed !== pending.size) return false
+  const last = stripped.at(-1)
+  if (last?.role !== "assistant" || !last.content.some((block) => block?.type === "text" && block.text?.trim())) return false
+  if (stripped.slice(base.length).some((message) => Array.isArray(message.content) && !message.content.length)) return false
+  return historyKey(stripped) === historyKey(history)
 }
 
 // Every tool_use of the turn's calls in messages has a tool_result after it.
@@ -3573,6 +3765,24 @@ function replayHistoryProblem(body, resultBlocks) {
     answered.add(block.tool_use_id)
   }
   return answered.size === ids.size ? null : "missing_tool_result"
+}
+
+// Answers the calls the client dropped as cancelled and leaves the session at
+// the client's history, ready for its next message. False when the session
+// can't take it as it is; the caller then replays, as for a fork.
+async function keepDroppedTurn(proc, turn, opts) {
+  if (proc.toolsGrew(opts.tools) || proc.workDir !== opts.workDir ||
+    !sameInstructions(proc.instructions, opts.instructions)) return false
+  const results = turn.calls.filter((call) => call.id && !call.result && !call.mcpResponded).map((call) => ({
+    block: { tool_use_id: call.id },
+    call,
+    result: { content: [{ type: "text", text: DROPPED_NOTE }], isError: true },
+  }))
+  try {
+    return await proc.steerInSession(turn, results, opts.history)
+  } catch {
+    return false
+  }
 }
 
 async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn closed") {
@@ -6831,7 +7041,7 @@ export const AntigravityBridgePlugin = async () => {
         // asked what it offers. magpie keeps the list it had and the
         // user's picks with it; a cold host's short list dropped every
         // other pick (Archivemylife on X: the picks didn't stick).
-        if (cachedModelCatalog.isFallback || (!acpOfferedModels && (modelCatalogRefreshPromise || offeredProbePromise))) {
+        if (ms().cachedModelCatalog.isFallback || (!ms().acpOfferedModels && (ms().modelCatalogRefreshPromise || ms().offeredProbePromise))) {
           out[Symbol.for("magpie.fellBack")] = true
         }
         for (const model of catalog.models) {
