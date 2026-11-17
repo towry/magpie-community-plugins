@@ -192,6 +192,7 @@ agy 的拒绝原因，不显示数字。
 | `AGY_BRIDGE_THINKING` | 开启 | 设为 `0` 关闭思考摘要 |
 | `AGY_BRIDGE_EFFORT` | 未设置 | 强制思考等级：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `AGY_BRIDGE_MINIMAL_AGENT` | 关闭 | 设为 `1` 去掉 agy 自带的提示组件，见下文「精简 agent」 |
+| `AGY_BRIDGE_TELEMETRY` | 关闭（agy 不上报） | 插件启动 agy 时带上 `--disable-telemetry`（agy 的 `acp --help` 没这个开关就带不上）；设成 `1` 保留 agy 自己的上报 |
 | `AGY_BRIDGE_SYSTEM_APPEND` | 关闭 | 设为 `1` 把客户端的系统提示词附加到 agy 自己的系统提示词后面，而不是放进第一条提示词，见下文 |
 | `AGY_BRIDGE_IDLE_MS` | 600000 | 进程空闲多久后回收（会话仍可续接） |
 | `AGY_BRIDGE_SPARE` | 开启 | 每个账号预先启动一个备用 agy（只启动、不建会话，不发任何请求），新对话直接用它，省掉 agy 的启动时间；设为 `0` 关闭 |
@@ -226,6 +227,9 @@ agy 发出之前去掉计费那一行，其余几行换成同义的说法（"bui
 
 DeepSeek Harness 的 `@` 路径说明段（"Tokens prefixed with @ are paths…"）也和 Antigravity 提供商一样
 换成同义的说法再发：原文照发时 `gemini-4-argon` 大多很快答完、不思考、只走一步（#1028）。
+DeepSeek Harness 的第一句 "You are an AI agent powered by DeepSeek Harness."（#1171）和它 Web GUI 段里的
+"The browser provides no implicit DOM, route, or screenshot context."（#1105）原样发出也会被回 429，
+分别改成 "You're …" 和 "The browser gives …" 再发。
 
 设为 `1` 后，临时 agent 带上 `excludeDefaultComponents: true`：发往上游的请求里不再有
 agy 自己的系统提示词，只剩插件的一行工具说明和客户端的系统提示词（同样以上面两种方式之一
@@ -255,10 +259,16 @@ agy 自己的系统提示词，只剩插件的一行工具说明和客户端的�
   从 agy 的日志中取出真实原因，并以错误结束本轮，不会当作正常回复输出。agy 1.5.8 的
   "There was a network issue connecting to the server" 和 "Your AI credits balance is
   too low to continue." 也一样（后者按额度不足报错）；`⚠ API error (attempt N)` 这类
-  重试中的提示行会被去掉。若结尾是 "This service has been disabled in this account for
+  重试中的提示行会被去掉。agy 自己撞上输出上限后重试时，也会把三行提示写进正文
+  （"Your previous response was cut off because it exceeded the output token limit"、
+  它的续写指令和 "Retries remaining: N"），这三行同样会被去掉，后面模型的续写照常
+  输出。若结尾是 "This service has been disabled in this account for
   violation of Terms of Service"，会按禁止重试的 403 语义 `permission_error` 返回，而不是
   当成正常正文。结尾是 "Verification Required"（Google 要求先验证这个账号）时也一样，
   并带上 agy 记下的验证链接；没有链接时说明去哪里验证。
+  结尾是 "⚠ Individual quota reached. … Resets in 1h18m40s."（这个账号自己的额度用完）时，
+  按额度不足（`rate_limit_error`，非流式为 HTTP 429）结束本轮，原文和重置时间一并带上，
+  magpie 据此让这个账号歇到重置，并改问下一个账号。
 - **HTTP 409，提示工具结果与历史对不上**：通常是客户端在对话中途改写了历史或工具 ID。
   能确定对应关系时插件会重建会话；无法确定时直接拒绝，不做猜测。
   Hermes Agent 会把一次批量的 `tool_call({"calls": [...]})` 在自己的历史里拆成每项一次调用，
